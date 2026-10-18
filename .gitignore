@@ -1,0 +1,7 @@
+# Binaries
+dedupetar
+
+# Local test / data directories
+.dedupetar_data/
+*.db
+*.pack
