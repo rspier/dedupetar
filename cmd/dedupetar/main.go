@@ -146,6 +146,7 @@ func runIngest(dataDir string, args []string) {
 	fs := flag.NewFlagSet("ingest", flag.ExitOnError)
 	nameFlag := fs.String("name", "", "Custom name for archive")
 	thresholdFlag := fs.Int64("threshold", cas.DefaultBlobThreshold, "Blob size threshold in bytes (default 1MB)")
+	forceFlag := fs.Bool("force", false, "Force re-ingest even if duplicate archive already exists")
 	fs.Parse(args)
 
 	if fs.NArg() < 1 {
@@ -161,6 +162,19 @@ func runIngest(dataDir string, args []string) {
 	}
 	defer f.Close()
 
+	var sourcePath string
+	var sourceSize int64
+	var sourceMtime int64
+	if fi, err := f.Stat(); err == nil && fi.Mode().IsRegular() {
+		if abs, err := filepath.Abs(archivePath); err == nil {
+			sourcePath = abs
+		} else {
+			sourcePath = archivePath
+		}
+		sourceSize = fi.Size()
+		sourceMtime = fi.ModTime().UnixNano()
+	}
+
 	archiveName := *nameFlag
 	if archiveName == "" {
 		archiveName = filepath.Base(archivePath)
@@ -172,11 +186,27 @@ func runIngest(dataDir string, args []string) {
 	ctx := context.Background()
 	fmt.Printf("Ingesting %s...\n", archiveName)
 	res, err := eng.Ingest(ctx, f, engine.IngestOptions{
-		Name: archiveName,
+		Name:        archiveName,
+		SourcePath:  sourcePath,
+		SourceSize:  sourceSize,
+		SourceMtime: sourceMtime,
+		Force:       *forceFlag,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Ingestion failed: %v\n", err)
 		os.Exit(1)
+	}
+
+	if res.AlreadyExists {
+		fmt.Println("\nArchive Already Ingested (Short-Circuited Duplicate):")
+		fmt.Printf("  Archive ID:              %s\n", res.ArchiveID)
+		fmt.Printf("  Name:                    %s\n", res.Name)
+		fmt.Printf("  Total Entries:           %d\n", res.TotalEntries)
+		fmt.Printf("  Total Uncompressed Size: %d bytes\n", res.TotalUncompressedBytes)
+		fmt.Printf("  Uncompressed SHA256:     %s\n", res.UncompressedSHA256)
+		fmt.Printf("  Status:                  Identical archive already stored; skipped duplicate recipe write.\n")
+		fmt.Printf("  Duration:                %v\n", res.Duration)
+		return
 	}
 
 	fmt.Println("\nIngestion Completed Successfully:")

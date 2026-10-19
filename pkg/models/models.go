@@ -78,6 +78,9 @@ type ArchiveManifest struct {
 	TotalEntries           uint32           `json:"total_entries"`
 	TrailingPaddingData    []byte           `json:"trailing_padding_data"`
 	RecipeChunks           []RecipeChunkRef `json:"recipe_chunks"`
+	SourcePath             string           `json:"source_path,omitempty"`
+	SourceSize             int64            `json:"source_size,omitempty"`
+	SourceMtime            int64            `json:"source_mtime,omitempty"`
 	CreatedAt              time.Time        `json:"created_at"`
 }
 
@@ -90,6 +93,9 @@ type ArchiveRecord struct {
 	Status             string    `json:"status"` // 'active', 'deleted'
 	ManifestKey        string    `json:"manifest_key"`
 	TotalEntries       uint32    `json:"total_entries"`
+	SourcePath         string    `json:"source_path,omitempty"`
+	SourceSize         int64     `json:"source_size,omitempty"`
+	SourceMtime        int64     `json:"source_mtime,omitempty"`
 	CreatedAt          time.Time `json:"created_at"`
 }
 

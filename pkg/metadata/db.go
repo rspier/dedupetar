@@ -94,8 +94,14 @@ func (d *DB) initSchema() error {
 		status VARCHAR(16) NOT NULL DEFAULT 'active',
 		manifest_key VARCHAR(255) NOT NULL,
 		total_entries INTEGER NOT NULL DEFAULT 0,
+		source_path VARCHAR(1024) NOT NULL DEFAULT '',
+		source_size BIGINT NOT NULL DEFAULT 0,
+		source_mtime BIGINT NOT NULL DEFAULT 0,
 		created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 	);
+
+	CREATE INDEX IF NOT EXISTS idx_archives_sha ON archives(uncompressed_sha256);
+	CREATE INDEX IF NOT EXISTS idx_archives_source ON archives(source_path, source_size, source_mtime);
 
 	CREATE TABLE IF NOT EXISTS archive_blob_refs (
 		archive_id VARCHAR(64) REFERENCES archives(archive_id) ON DELETE CASCADE,
@@ -122,6 +128,11 @@ func (d *DB) initSchema() error {
 		codec VARCHAR(16) NOT NULL DEFAULT 'none'
 	);
 
+	CREATE TABLE IF NOT EXISTS file_fingerprints (
+		fingerprint VARCHAR(512) PRIMARY KEY,
+		hash VARCHAR(64) NOT NULL
+	);
+
 	CREATE TABLE IF NOT EXISTS recipe_chunks (
 		archive_id VARCHAR(64) NOT NULL,
 		chunk_index INTEGER NOT NULL,
@@ -142,8 +153,19 @@ func (d *DB) initSchema() error {
 		created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 	);
 	`
-	_, err := d.db.Exec(schema)
-	return err
+	if _, err := d.db.Exec(schema); err != nil {
+		return err
+	}
+
+	// Migrations for existing databases
+	_, _ = d.db.Exec("ALTER TABLE archives ADD COLUMN source_path VARCHAR(1024) NOT NULL DEFAULT ''")
+	_, _ = d.db.Exec("ALTER TABLE archives ADD COLUMN source_size BIGINT NOT NULL DEFAULT 0")
+	_, _ = d.db.Exec("ALTER TABLE archives ADD COLUMN source_mtime BIGINT NOT NULL DEFAULT 0")
+	_, _ = d.db.Exec("CREATE INDEX IF NOT EXISTS idx_archives_sha ON archives(uncompressed_sha256)")
+	_, _ = d.db.Exec("CREATE INDEX IF NOT EXISTS idx_archives_source ON archives(source_path, source_size, source_mtime)")
+	_, _ = d.db.Exec("CREATE TABLE IF NOT EXISTS file_fingerprints (fingerprint VARCHAR(512) PRIMARY KEY, hash VARCHAR(64) NOT NULL)")
+
+	return nil
 }
 
 // FindCASEntry checks if a payload hash is already recorded.
@@ -246,10 +268,10 @@ func (d *DB) SaveArchiveTransaction(ctx context.Context, manifest *models.Archiv
 
 	// 1. Insert Archive
 	_, err = tx.ExecContext(ctx,
-		"INSERT INTO archives (archive_id, name, uncompressed_size, uncompressed_sha256, status, manifest_key, total_entries, created_at) "+
-			"VALUES (?, ?, ?, ?, 'active', ?, ?, ?)",
+		"INSERT INTO archives (archive_id, name, uncompressed_size, uncompressed_sha256, status, manifest_key, total_entries, source_path, source_size, source_mtime, created_at) "+
+			"VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)",
 		manifest.ArchiveID, manifest.OriginalName, manifest.TotalUncompressedBytes, manifest.UncompressedSHA256,
-		manifestKey, manifest.TotalEntries, manifest.CreatedAt,
+		manifestKey, manifest.TotalEntries, manifest.SourcePath, manifest.SourceSize, manifest.SourceMtime, manifest.CreatedAt,
 	)
 	if err != nil {
 		return fmt.Errorf("inserting archive: %w", err)
@@ -328,10 +350,10 @@ func (d *DB) GetArchive(ctx context.Context, archiveID string) (*models.ArchiveR
 	var rec models.ArchiveRecord
 	var createdAtStr string
 	err := d.db.QueryRowContext(ctx,
-		"SELECT archive_id, name, uncompressed_size, uncompressed_sha256, status, manifest_key, total_entries, created_at "+
+		"SELECT archive_id, name, uncompressed_size, uncompressed_sha256, status, manifest_key, total_entries, source_path, source_size, source_mtime, created_at "+
 			"FROM archives WHERE archive_id = ?",
 		archiveID,
-	).Scan(&rec.ArchiveID, &rec.Name, &rec.UncompressedSize, &rec.UncompressedSHA256, &rec.Status, &rec.ManifestKey, &rec.TotalEntries, &createdAtStr)
+	).Scan(&rec.ArchiveID, &rec.Name, &rec.UncompressedSize, &rec.UncompressedSHA256, &rec.Status, &rec.ManifestKey, &rec.TotalEntries, &rec.SourcePath, &rec.SourceSize, &rec.SourceMtime, &createdAtStr)
 	if err != nil {
 		return nil, err
 	}
@@ -339,12 +361,87 @@ func (d *DB) GetArchive(ctx context.Context, archiveID string) (*models.ArchiveR
 	return &rec, nil
 }
 
+// FindArchiveBySHA256 returns an active archive with the given uncompressed sha256 if it exists.
+func (d *DB) FindArchiveBySHA256(ctx context.Context, sha256 string) (*models.ArchiveRecord, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	var rec models.ArchiveRecord
+	var createdAtStr string
+	err := d.db.QueryRowContext(ctx,
+		"SELECT archive_id, name, uncompressed_size, uncompressed_sha256, status, manifest_key, total_entries, source_path, source_size, source_mtime, created_at "+
+			"FROM archives WHERE uncompressed_sha256 = ? AND status = 'active' LIMIT 1",
+		sha256,
+	).Scan(&rec.ArchiveID, &rec.Name, &rec.UncompressedSize, &rec.UncompressedSHA256, &rec.Status, &rec.ManifestKey, &rec.TotalEntries, &rec.SourcePath, &rec.SourceSize, &rec.SourceMtime, &createdAtStr)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	rec.CreatedAt = parseTime(createdAtStr)
+	return &rec, nil
+}
+
+// FindArchiveBySourceFile returns an active archive matching the source file path, size, and mtime.
+func (d *DB) FindArchiveBySourceFile(ctx context.Context, sourcePath string, sourceSize int64, sourceMtime int64) (*models.ArchiveRecord, error) {
+	if sourcePath == "" || sourceSize == 0 {
+		return nil, nil
+	}
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	var rec models.ArchiveRecord
+	var createdAtStr string
+	err := d.db.QueryRowContext(ctx,
+		"SELECT archive_id, name, uncompressed_size, uncompressed_sha256, status, manifest_key, total_entries, source_path, source_size, source_mtime, created_at "+
+			"FROM archives WHERE source_path = ? AND source_size = ? AND source_mtime = ? AND status = 'active' LIMIT 1",
+		sourcePath, sourceSize, sourceMtime,
+	).Scan(&rec.ArchiveID, &rec.Name, &rec.UncompressedSize, &rec.UncompressedSHA256, &rec.Status, &rec.ManifestKey, &rec.TotalEntries, &rec.SourcePath, &rec.SourceSize, &rec.SourceMtime, &createdAtStr)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	rec.CreatedAt = parseTime(createdAtStr)
+	return &rec, nil
+}
+
+// FindFingerprint checks if a header fingerprint is already associated with a known payload hash.
+func (d *DB) FindFingerprint(ctx context.Context, fingerprint string) (string, bool, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	var hash string
+	err := d.db.QueryRowContext(ctx, "SELECT hash FROM file_fingerprints WHERE fingerprint = ?", fingerprint).Scan(&hash)
+	if err == sql.ErrNoRows {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return hash, true, nil
+}
+
+// RecordFingerprint associates a header fingerprint with a payload hash.
+func (d *DB) RecordFingerprint(ctx context.Context, fingerprint, hash string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	_, err := d.db.ExecContext(ctx,
+		"INSERT OR REPLACE INTO file_fingerprints (fingerprint, hash) VALUES (?, ?)",
+		fingerprint, hash,
+	)
+	return err
+}
+
 // ListArchives returns all archives (optionally filtering active ones).
 func (d *DB) ListArchives(ctx context.Context, activeOnly bool) ([]models.ArchiveRecord, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
-	query := "SELECT archive_id, name, uncompressed_size, uncompressed_sha256, status, manifest_key, total_entries, created_at FROM archives"
+	query := "SELECT archive_id, name, uncompressed_size, uncompressed_sha256, status, manifest_key, total_entries, source_path, source_size, source_mtime, created_at FROM archives"
 	if activeOnly {
 		query += " WHERE status = 'active'"
 	}
@@ -360,7 +457,7 @@ func (d *DB) ListArchives(ctx context.Context, activeOnly bool) ([]models.Archiv
 	for rows.Next() {
 		var rec models.ArchiveRecord
 		var createdAtStr string
-		if err := rows.Scan(&rec.ArchiveID, &rec.Name, &rec.UncompressedSize, &rec.UncompressedSHA256, &rec.Status, &rec.ManifestKey, &rec.TotalEntries, &createdAtStr); err != nil {
+		if err := rows.Scan(&rec.ArchiveID, &rec.Name, &rec.UncompressedSize, &rec.UncompressedSHA256, &rec.Status, &rec.ManifestKey, &rec.TotalEntries, &rec.SourcePath, &rec.SourceSize, &rec.SourceMtime, &createdAtStr); err != nil {
 			return nil, err
 		}
 		rec.CreatedAt = parseTime(createdAtStr)

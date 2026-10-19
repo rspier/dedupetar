@@ -318,3 +318,155 @@ func TestCompressionRatio(t *testing.T) {
 		t.Fatalf("Reconstructed tar does not match original!")
 	}
 }
+
+func TestDuplicateArchiveShortCircuit(t *testing.T) {
+	eng, db, _, tmpDir := setupTestEngine(t, 256)
+	defer os.RemoveAll(tmpDir)
+	defer db.Close()
+
+	files := []struct{ Name, Body string }{
+		{"file1.txt", "Hello world"},
+		{"file2.txt", strings.Repeat("Content payload 123 ", 30)},
+	}
+	originalTar := createTestTarball(t, files)
+
+	// Save tarball to disk to test Tier 1 file-level short-circuiting
+	tarPath := filepath.Join(tmpDir, "sample.tar")
+	if err := os.WriteFile(tarPath, originalTar, 0644); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+	fi, err := os.Stat(tarPath)
+	if err != nil {
+		t.Fatalf("Stat failed: %v", err)
+	}
+
+	ctx := context.Background()
+
+	// 1. Initial Ingestion
+	f1, err := os.Open(tarPath)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer f1.Close()
+
+	res1, err := eng.Ingest(ctx, f1, IngestOptions{
+		Name:        "sample.tar",
+		SourcePath:  tarPath,
+		SourceSize:  fi.Size(),
+		SourceMtime: fi.ModTime().UnixNano(),
+	})
+	if err != nil {
+		t.Fatalf("Initial Ingest failed: %v", err)
+	}
+	if res1.AlreadyExists {
+		t.Fatalf("Initial ingest should not report AlreadyExists")
+	}
+
+	// 2. Second Ingestion with same source file (Tier 1 short-circuit)
+	f2, err := os.Open(tarPath)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer f2.Close()
+
+	res2, err := eng.Ingest(ctx, f2, IngestOptions{
+		Name:        "sample.tar",
+		SourcePath:  tarPath,
+		SourceSize:  fi.Size(),
+		SourceMtime: fi.ModTime().UnixNano(),
+	})
+	if err != nil {
+		t.Fatalf("Second Ingest failed: %v", err)
+	}
+	if !res2.AlreadyExists {
+		t.Fatalf("Expected second ingest to short-circuit with AlreadyExists=true")
+	}
+	if res2.ArchiveID != res1.ArchiveID {
+		t.Fatalf("Expected ArchiveID %s, got %s", res1.ArchiveID, res2.ArchiveID)
+	}
+
+	// 3. Streaming Ingestion without source path (Tier 3 stream SHA256 short-circuit)
+	res3, err := eng.Ingest(ctx, bytes.NewReader(originalTar), IngestOptions{
+		Name: "sample_stream.tar",
+	})
+	if err != nil {
+		t.Fatalf("Streaming Ingest failed: %v", err)
+	}
+	if !res3.AlreadyExists {
+		t.Fatalf("Expected streaming duplicate ingest to short-circuit with AlreadyExists=true")
+	}
+	if res3.ArchiveID != res1.ArchiveID {
+		t.Fatalf("Expected ArchiveID %s, got %s", res1.ArchiveID, res3.ArchiveID)
+	}
+
+	// 4. Force Ingestion (bypasses short-circuiting)
+	res4, err := eng.Ingest(ctx, bytes.NewReader(originalTar), IngestOptions{
+		Name:  "sample_forced.tar",
+		Force: true,
+	})
+	if err != nil {
+		t.Fatalf("Force Ingest failed: %v", err)
+	}
+	if res4.AlreadyExists {
+		t.Fatalf("Forced ingest should not report AlreadyExists")
+	}
+	if res4.ArchiveID == res1.ArchiveID {
+		t.Fatalf("Forced ingest should generate a new ArchiveID")
+	}
+}
+
+func TestDuplicateFilePayloadShortCircuit(t *testing.T) {
+	eng, db, _, tmpDir := setupTestEngine(t, 128) // 128B threshold -> files > 128B are blobs
+	defer os.RemoveAll(tmpDir)
+	defer db.Close()
+
+	largeContent := strings.Repeat("Repeated large file content block for deduplication test. ", 50)
+
+	// Archive 1 contains large file
+	files1 := []struct{ Name, Body string }{
+		{"large_common.bin", largeContent},
+		{"unique_1.txt", "Unique content in archive 1"},
+	}
+	tar1 := createTestTarball(t, files1)
+
+	ctx := context.Background()
+	res1, err := eng.Ingest(ctx, bytes.NewReader(tar1), IngestOptions{Name: "archive1.tar"})
+	if err != nil {
+		t.Fatalf("Ingest 1 failed: %v", err)
+	}
+	if res1.AlreadyExists {
+		t.Fatalf("Ingest 1 should not report AlreadyExists")
+	}
+
+	// Archive 2 contains the same large file + different unique file
+	files2 := []struct{ Name, Body string }{
+		{"large_common.bin", largeContent},
+		{"unique_2.txt", "Unique content in archive 2"},
+	}
+	tar2 := createTestTarball(t, files2)
+
+	res2, err := eng.Ingest(ctx, bytes.NewReader(tar2), IngestOptions{Name: "archive2.tar"})
+	if err != nil {
+		t.Fatalf("Ingest 2 failed: %v", err)
+	}
+
+	// Archive 2 should NOT report AlreadyExists (it's a distinct archive)
+	if res2.AlreadyExists {
+		t.Fatalf("Archive 2 should not be reported as whole archive duplicate")
+	}
+
+	// Large file must be reported as deduplicated
+	if res2.DeduplicatedBytes < int64(len(largeContent)) {
+		t.Errorf("Expected deduplicated bytes >= %d, got %d", len(largeContent), res2.DeduplicatedBytes)
+	}
+
+	// Reconstruct archive 2 and verify byte-for-byte fidelity
+	buf := new(bytes.Buffer)
+	if _, _, err := eng.Reconstruct(ctx, res2.ArchiveID, buf); err != nil {
+		t.Fatalf("Reconstruct failed: %v", err)
+	}
+	if !bytes.Equal(buf.Bytes(), tar2) {
+		t.Fatalf("Reconstructed archive2 does not match original tar2 byte-for-byte!")
+	}
+}
+

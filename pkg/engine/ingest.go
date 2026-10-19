@@ -29,6 +29,10 @@ const (
 type IngestOptions struct {
 	Name            string
 	ChunkEntryLimit int
+	SourcePath      string
+	SourceSize      int64
+	SourceMtime     int64
+	Force           bool
 }
 
 // IngestResult reports metrics from an ingestion operation.
@@ -43,16 +47,33 @@ type IngestResult struct {
 	DeduplicatedBytes      int64         `json:"deduplicated_bytes"`
 	DeduplicationRatio     float64       `json:"deduplication_ratio"`
 	CompressionRatio       float64       `json:"compression_ratio"`
+	AlreadyExists          bool          `json:"already_exists"`
 	Duration               time.Duration `json:"duration"`
+}
+
+var copyBufferPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, 128*1024)
+		return &b
+	},
+}
+
+func getCopyBuffer() []byte {
+	return *copyBufferPool.Get().(*[]byte)
+}
+
+func putCopyBuffer(b []byte) {
+	copyBufferPool.Put(&b)
 }
 
 // Engine coordinates ingestion, reassembly, and storage operations.
 type Engine struct {
-	db              *metadata.DB
-	blobStore       cas.BlobStore
-	packfileManager *cas.PackfileManager
-	blobThreshold   int64
-	casCache        sync.Map // in-memory cache: hash -> *models.PayloadLocation
+	db               *metadata.DB
+	blobStore        cas.BlobStore
+	packfileManager  *cas.PackfileManager
+	blobThreshold    int64
+	casCache         sync.Map // in-memory cache: hash -> *models.PayloadLocation
+	fingerprintCache sync.Map // in-memory cache: fingerprint -> string
 }
 
 // New creates an Engine instance.
@@ -88,9 +109,50 @@ func (e *Engine) recordCAS(ctx context.Context, hash string, loc models.PayloadL
 	return e.db.RecordCASEntry(ctx, hash, loc)
 }
 
+func (e *Engine) lookupFingerprint(ctx context.Context, fp string) (string, bool) {
+	if val, ok := e.fingerprintCache.Load(fp); ok {
+		return val.(string), true
+	}
+	hash, found, err := e.db.FindFingerprint(ctx, fp)
+	if err == nil && found && hash != "" {
+		e.fingerprintCache.Store(fp, hash)
+		return hash, true
+	}
+	return "", false
+}
+
+func (e *Engine) recordFingerprint(ctx context.Context, fp, hash string) {
+	if fp == "" || hash == "" {
+		return
+	}
+	e.fingerprintCache.Store(fp, hash)
+	_ = e.db.RecordFingerprint(ctx, fp, hash)
+}
+
 // Ingest streams a tar or tar.gz archive into DedupeTar with streaming multi-core compression and in-memory dedup caching.
 func (e *Engine) Ingest(ctx context.Context, r io.Reader, opts IngestOptions) (*IngestResult, error) {
 	startTime := time.Now()
+
+	// Tier 1 check: if SourcePath is provided and not Force, check if the source file was already ingested unmodified
+	if opts.SourcePath != "" && opts.SourceSize > 0 && !opts.Force {
+		existing, err := e.db.FindArchiveBySourceFile(ctx, opts.SourcePath, opts.SourceSize, opts.SourceMtime)
+		if err == nil && existing != nil && existing.Status == "active" {
+			return &IngestResult{
+				ArchiveID:              existing.ArchiveID,
+				Name:                   existing.Name,
+				TotalEntries:           existing.TotalEntries,
+				TotalUncompressedBytes: existing.UncompressedSize,
+				UncompressedSHA256:     existing.UncompressedSHA256,
+				NewBytesStored:         0,
+				UncompressedNewBytes:   0,
+				DeduplicatedBytes:      existing.UncompressedSize,
+				DeduplicationRatio:     1.0,
+				CompressionRatio:       1.0,
+				AlreadyExists:          true,
+				Duration:               time.Since(startTime),
+			}, nil
+		}
+	}
 
 	// Sniff first two bytes to check for gzip magic header (0x1f, 0x8b)
 	headerSniff := make([]byte, 2)
@@ -160,6 +222,8 @@ func (e *Engine) Ingest(ctx context.Context, r io.Reader, opts IngestOptions) (*
 		if payloadSize > 0 {
 			totalUncompressedBytes += payloadSize + int64(hdr.PayloadPadding)
 
+			headerFP := hashBLAKE3(hdr.RawHeaderBlocks)
+
 			if payloadSize <= e.blobThreshold {
 				// Small payload: read into buffer and compute BLAKE3
 				buf := make([]byte, payloadSize)
@@ -167,6 +231,7 @@ func (e *Engine) Ingest(ctx context.Context, r io.Reader, opts IngestOptions) (*
 					return nil, fmt.Errorf("reading small payload: %w", err)
 				}
 				hash := hashBLAKE3(buf)
+				e.recordFingerprint(ctx, headerFP, hash)
 
 				// Check deduplication (fast in-memory cache)
 				existingLoc, found, err := e.lookupCAS(ctx, hash)
@@ -203,91 +268,122 @@ func (e *Engine) Ingest(ctx context.Context, r io.Reader, opts IngestOptions) (*
 				}
 			} else {
 				// Large payload (> threshold):
-				// Single-pass streaming directly to disk while computing BLAKE3 and multi-core Zstandard!
-				// Eliminates all double-reading, RAM bloat, and redundant disk copies.
-				tmpWriter, tmpPath, err := e.blobStore.CreateTempBlob(ctx)
-				if err != nil {
-					return nil, fmt.Errorf("creating streaming temp blob: %w", err)
+				// Tier 2: First check if this exact file header was already seen and stored in CAS.
+				// If so, short-circuit by streaming directly through BLAKE3, completely bypassing
+				// all CPU-intensive Zstandard compression and disk temp file writes!
+				var shortCircuited bool
+				if predictedHash, hasFP := e.lookupFingerprint(ctx, headerFP); hasFP {
+					if existingLoc, inCAS, _ := e.lookupCAS(ctx, predictedHash); inCAS && existingLoc != nil {
+						hasher := blake3.New()
+						buf := getCopyBuffer()
+						written, err := io.CopyBuffer(hasher, payloadReader, buf)
+						putCopyBuffer(buf)
+						if err != nil {
+							return nil, fmt.Errorf("reading duplicate payload stream: %w", err)
+						}
+						if written != payloadSize {
+							return nil, fmt.Errorf("duplicate payload size mismatch: read %d, want %d", written, payloadSize)
+						}
+						actualHash := hex.EncodeToString(hasher.Sum(nil))
+						if actualHash == predictedHash {
+							// Successfully short-circuited duplicate file!
+							loc = *existingLoc
+							deduplicatedBytes += payloadSize
+							referencedBlobIDs = append(referencedBlobIDs, loc.StandaloneBlobHash)
+							shortCircuited = true
+						}
+					}
 				}
 
-				hasher := blake3.New()
-				zstdWriter, err := cas.NewStreamingCompressor(tmpWriter)
-				if err != nil {
-					tmpWriter.Close()
-					os.Remove(tmpPath)
-					return nil, fmt.Errorf("creating streaming compressor: %w", err)
-				}
+				if !shortCircuited {
+					// Single-pass streaming directly to disk while computing BLAKE3 and multi-core Zstandard!
+					tmpWriter, tmpPath, err := e.blobStore.CreateTempBlob(ctx)
+					if err != nil {
+						return nil, fmt.Errorf("creating streaming temp blob: %w", err)
+					}
 
-				multiWriter := io.MultiWriter(zstdWriter, hasher)
-				written, err := io.Copy(multiWriter, payloadReader)
-				if err != nil {
-					zstdWriter.Close()
-					tmpWriter.Close()
-					os.Remove(tmpPath)
-					return nil, fmt.Errorf("streaming large payload: %w", err)
-				}
-				if written != payloadSize {
-					zstdWriter.Close()
-					tmpWriter.Close()
-					os.Remove(tmpPath)
-					return nil, fmt.Errorf("large payload size mismatch: wrote %d, want %d", written, payloadSize)
-				}
+					hasher := blake3.New()
+					zstdWriter, err := cas.NewStreamingCompressor(tmpWriter)
+					if err != nil {
+						tmpWriter.Close()
+						os.Remove(tmpPath)
+						return nil, fmt.Errorf("creating streaming compressor: %w", err)
+					}
 
-				// Flush multi-core zstd encoder
-				if err := zstdWriter.Close(); err != nil {
-					tmpWriter.Close()
-					os.Remove(tmpPath)
-					return nil, fmt.Errorf("closing streaming compressor: %w", err)
-				}
-				if err := tmpWriter.Close(); err != nil {
-					os.Remove(tmpPath)
-					return nil, fmt.Errorf("closing temp blob: %w", err)
-				}
+					multiWriter := io.MultiWriter(zstdWriter, hasher)
+					written, err := io.Copy(multiWriter, payloadReader)
+					if err != nil {
+						zstdWriter.Close()
+						tmpWriter.Close()
+						os.Remove(tmpPath)
+						return nil, fmt.Errorf("streaming large payload: %w", err)
+					}
+					if written != payloadSize {
+						zstdWriter.Close()
+						tmpWriter.Close()
+						os.Remove(tmpPath)
+						return nil, fmt.Errorf("large payload size mismatch: wrote %d, want %d", written, payloadSize)
+					}
 
-				hash := hex.EncodeToString(hasher.Sum(nil))
+					// Flush multi-core zstd encoder
+					if err := zstdWriter.Close(); err != nil {
+						tmpWriter.Close()
+						os.Remove(tmpPath)
+						return nil, fmt.Errorf("closing streaming compressor: %w", err)
+					}
+					if err := tmpWriter.Close(); err != nil {
+						os.Remove(tmpPath)
+						return nil, fmt.Errorf("closing temp blob: %w", err)
+					}
 
-				// Check deduplication (fast in-memory cache first)
-				existingLoc, found, err := e.lookupCAS(ctx, hash)
-				if err != nil {
-					os.Remove(tmpPath)
-					return nil, fmt.Errorf("checking CAS entry for large payload: %w", err)
-				}
+					hash := hex.EncodeToString(hasher.Sum(nil))
 
-				if found && existingLoc != nil {
-					os.Remove(tmpPath) // Deduplicated, discard temp file immediately
-					loc = *existingLoc
-					deduplicatedBytes += payloadSize
-					referencedBlobIDs = append(referencedBlobIDs, loc.StandaloneBlobHash)
-				} else {
-					fi, err := os.Stat(tmpPath)
+					// Record header fingerprint -> hash for future short-circuiting!
+					e.recordFingerprint(ctx, headerFP, hash)
+
+					// Check deduplication (fast in-memory cache first)
+					existingLoc, found, err := e.lookupCAS(ctx, hash)
 					if err != nil {
 						os.Remove(tmpPath)
-						return nil, err
-					}
-					storedSize := fi.Size()
-
-					// Atomically move temp blob directly to blobs/<hash>
-					if err := e.blobStore.CommitBlob(ctx, tmpPath, hash); err != nil {
-						os.Remove(tmpPath)
-						return nil, fmt.Errorf("committing standalone blob: %w", err)
+						return nil, fmt.Errorf("checking CAS entry for large payload: %w", err)
 					}
 
-					loc = models.PayloadLocation{
-						Type:               models.StorageTypeBlob,
-						StandaloneBlobHash: hash,
-						CompressedSize:     storedSize,
-						Codec:              models.CodecZSTD,
-					}
-					newBytesStored += storedSize
-					uncompressedNewBytes += payloadSize
-					referencedBlobIDs = append(referencedBlobIDs, hash)
+					if found && existingLoc != nil {
+						os.Remove(tmpPath) // Deduplicated, discard temp file immediately
+						loc = *existingLoc
+						deduplicatedBytes += payloadSize
+						referencedBlobIDs = append(referencedBlobIDs, loc.StandaloneBlobHash)
+					} else {
+						fi, err := os.Stat(tmpPath)
+						if err != nil {
+							os.Remove(tmpPath)
+							return nil, err
+						}
+						storedSize := fi.Size()
 
-					// Update DB records and cache
-					if err := e.recordCAS(ctx, hash, loc); err != nil {
-						return nil, fmt.Errorf("recording cas entry: %w", err)
-					}
-					if err := e.db.RecordStorageObject(ctx, hash, "blob", storedSize); err != nil {
-						return nil, fmt.Errorf("recording storage object: %w", err)
+						// Atomically move temp blob directly to blobs/<hash>
+						if err := e.blobStore.CommitBlob(ctx, tmpPath, hash); err != nil {
+							os.Remove(tmpPath)
+							return nil, fmt.Errorf("committing standalone blob: %w", err)
+						}
+
+						loc = models.PayloadLocation{
+							Type:               models.StorageTypeBlob,
+							StandaloneBlobHash: hash,
+							CompressedSize:     storedSize,
+							Codec:              models.CodecZSTD,
+						}
+						newBytesStored += storedSize
+						uncompressedNewBytes += payloadSize
+						referencedBlobIDs = append(referencedBlobIDs, hash)
+
+						// Update DB records and cache
+						if err := e.recordCAS(ctx, hash, loc); err != nil {
+							return nil, fmt.Errorf("recording cas entry: %w", err)
+						}
+						if err := e.db.RecordStorageObject(ctx, hash, "blob", storedSize); err != nil {
+							return nil, fmt.Errorf("recording storage object: %w", err)
+						}
 					}
 				}
 			}
@@ -338,6 +434,27 @@ func (e *Engine) Ingest(ctx context.Context, r io.Reader, opts IngestOptions) (*
 
 	uncompressedSHA256 := hex.EncodeToString(shaHasher.Sum(nil))
 
+	// Tier 3 check: if an identical uncompressed archive was already ingested and is active, short-circuit
+	if !opts.Force {
+		existingArc, err := e.db.FindArchiveBySHA256(ctx, uncompressedSHA256)
+		if err == nil && existingArc != nil && existingArc.Status == "active" {
+			return &IngestResult{
+				ArchiveID:              existingArc.ArchiveID,
+				Name:                   existingArc.Name,
+				TotalEntries:           existingArc.TotalEntries,
+				TotalUncompressedBytes: existingArc.UncompressedSize,
+				UncompressedSHA256:     existingArc.UncompressedSHA256,
+				NewBytesStored:         0,
+				UncompressedNewBytes:   0,
+				DeduplicatedBytes:      existingArc.UncompressedSize,
+				DeduplicationRatio:     1.0,
+				CompressionRatio:       1.0,
+				AlreadyExists:          true,
+				Duration:               time.Since(startTime),
+			}, nil
+		}
+	}
+
 	name := opts.Name
 	if name == "" {
 		name = fmt.Sprintf("archive_%s.tar", archiveID)
@@ -351,6 +468,9 @@ func (e *Engine) Ingest(ctx context.Context, r io.Reader, opts IngestOptions) (*
 		TotalEntries:           totalEntries,
 		TrailingPaddingData:    trailingBytes,
 		RecipeChunks:           chunkRefs,
+		SourcePath:             opts.SourcePath,
+		SourceSize:             opts.SourceSize,
+		SourceMtime:            opts.SourceMtime,
 		CreatedAt:              time.Now(),
 	}
 
