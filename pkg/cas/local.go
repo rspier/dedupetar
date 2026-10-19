@@ -50,6 +50,25 @@ func (s *LocalBlobStore) getPackMutex(packfileID string) *sync.Mutex {
 	return v.(*sync.Mutex)
 }
 
+// CreateTempBlob creates a temporary writer directly in the blobs directory for streaming writes without buffering in RAM.
+func (s *LocalBlobStore) CreateTempBlob(ctx context.Context) (io.WriteCloser, string, error) {
+	f, err := os.CreateTemp(s.blobsDir, "tmp_blob_*")
+	if err != nil {
+		return nil, "", fmt.Errorf("creating temp blob: %w", err)
+	}
+	return f, f.Name(), nil
+}
+
+// CommitBlob renames a completed temporary blob to its final CAS hash destination.
+func (s *LocalBlobStore) CommitBlob(ctx context.Context, tmpPath string, hash string) error {
+	dst := s.blobPath(hash)
+	if _, err := os.Stat(dst); err == nil {
+		os.Remove(tmpPath)
+		return nil
+	}
+	return os.Rename(tmpPath, dst)
+}
+
 // PutBlob atomically writes a standalone CAS blob.
 func (s *LocalBlobStore) PutBlob(ctx context.Context, hash string, r io.Reader, size int64) error {
 	dst := s.blobPath(hash)

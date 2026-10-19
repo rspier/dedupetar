@@ -37,6 +37,12 @@ type BlobStore interface {
 	// ListObjects returns all objects currently stored.
 	ListObjects(ctx context.Context) ([]StorageObject, error)
 
+	// CreateTempBlob creates a temporary writer for streaming writes without buffering in RAM.
+	CreateTempBlob(ctx context.Context) (io.WriteCloser, string, error)
+
+	// CommitBlob renames a completed temporary blob to its final content-addressed hash.
+	CommitBlob(ctx context.Context, tmpPath string, hash string) error
+
 	// Close cleans up any open file handles or resources.
 	Close() error
 }

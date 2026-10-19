@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,16 +17,17 @@ import (
 
 // DB wraps the SQLite database operations for DedupeTar.
 type DB struct {
-	db *sql.DB
-	mu sync.RWMutex
+	db       *sql.DB
+	mu       sync.RWMutex
+	readOnly bool
 }
 
-// Open initializes SQLite connection and runs schema migrations.
+// Open initializes SQLite connection in read-write mode and runs schema migrations.
 func Open(dataSourceName string) (*DB, error) {
 	// Add pragmas for WAL mode and busy timeout for concurrent safety
 	dsn := dataSourceName
 	if dsn != ":memory:" {
-		if !contains(dsn, "_journal_mode") {
+		if !strings.Contains(dsn, "_journal_mode") {
 			dsn += "?_journal_mode=WAL&_busy_timeout=5000"
 		}
 	}
@@ -33,13 +36,44 @@ func Open(dataSourceName string) (*DB, error) {
 		return nil, fmt.Errorf("opening sqlite: %w", err)
 	}
 
-	metaDB := &DB{db: db}
+	metaDB := &DB{db: db, readOnly: false}
 	if err := metaDB.initSchema(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("initializing schema: %w", err)
 	}
 
 	return metaDB, nil
+}
+
+// OpenReadOnly opens an existing SQLite database in read-only mode (URI mode=ro).
+// It skips schema initialization and ensures queries are non-blocking and cannot acquire write locks.
+func OpenReadOnly(dataSourceName string) (*DB, error) {
+	dsn := dataSourceName
+	if dsn != ":memory:" {
+		cleanPath := strings.Split(dsn, "?")[0]
+		cleanPath = strings.TrimPrefix(cleanPath, "file:")
+		if _, err := os.Stat(cleanPath); os.IsNotExist(err) {
+			return nil, os.ErrNotExist
+		}
+
+		if strings.HasPrefix(dsn, "file:") {
+			if !strings.Contains(dsn, "mode=ro") {
+				dsn += "&mode=ro"
+			}
+		} else {
+			dsn = fmt.Sprintf("file:%s?mode=ro", dsn)
+		}
+		if !strings.Contains(dsn, "_busy_timeout") {
+			dsn += "&_busy_timeout=5000"
+		}
+	}
+
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("opening readonly sqlite: %w", err)
+	}
+
+	return &DB{db: db, readOnly: true}, nil
 }
 
 func contains(s, substr string) bool {

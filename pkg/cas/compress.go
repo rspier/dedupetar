@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"runtime"
 	"sync"
 
 	"tarchive/pkg/models"
@@ -12,37 +13,43 @@ import (
 )
 
 var (
-	zstdEncoder *zstd.Encoder
-	zstdDecoder *zstd.Decoder
-	initOnce    sync.Once
-	initErr     error
+	encoderPool = sync.Pool{
+		New: func() interface{} {
+			enc, err := zstd.NewWriter(nil,
+				zstd.WithEncoderLevel(zstd.SpeedFastest),
+				zstd.WithEncoderConcurrency(1),
+			)
+			if err != nil {
+				panic(err)
+			}
+			return enc
+		},
+	}
+
+	decoderPool = sync.Pool{
+		New: func() interface{} {
+			dec, err := zstd.NewReader(nil, zstd.WithDecoderConcurrency(1))
+			if err != nil {
+				panic(err)
+			}
+			return dec
+		},
+	}
 )
 
-func initZstd() error {
-	initOnce.Do(func() {
-		zstdEncoder, initErr = zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedDefault))
-		if initErr != nil {
-			return
-		}
-		zstdDecoder, initErr = zstd.NewReader(nil)
-	})
-	return initErr
-}
-
-// CompressAdaptive attempts to compress data with Zstandard.
+// CompressAdaptive attempts to compress data with Zstandard using pooled encoders.
 // If compression saves at least 5% of space, the compressed bytes and CodecZSTD are returned.
 // Otherwise, the original uncompressed bytes and CodecNone are returned.
 func CompressAdaptive(raw []byte) ([]byte, models.CompressionCodec, error) {
-	if err := initZstd(); err != nil {
-		return nil, models.CodecNone, fmt.Errorf("initializing zstd: %w", err)
-	}
-
 	// Tiny payloads (< 32 bytes) usually expand under compression
 	if len(raw) < 32 {
 		return raw, models.CodecNone, nil
 	}
 
-	compressed := zstdEncoder.EncodeAll(raw, make([]byte, 0, len(raw)))
+	enc := encoderPool.Get().(*zstd.Encoder)
+	defer encoderPool.Put(enc)
+
+	compressed := enc.EncodeAll(raw, make([]byte, 0, len(raw)))
 	// Require at least a 5% savings threshold
 	if len(compressed) < int(float64(len(raw))*0.95) {
 		return compressed, models.CodecZSTD, nil
@@ -57,10 +64,10 @@ func Decompress(data []byte, codec models.CompressionCodec) ([]byte, error) {
 	case models.CodecNone, "":
 		return data, nil
 	case models.CodecZSTD:
-		if err := initZstd(); err != nil {
-			return nil, fmt.Errorf("initializing zstd: %w", err)
-		}
-		decompressed, err := zstdDecoder.DecodeAll(data, nil)
+		dec := decoderPool.Get().(*zstd.Decoder)
+		defer decoderPool.Put(dec)
+
+		decompressed, err := dec.DecodeAll(data, nil)
 		if err != nil {
 			return nil, fmt.Errorf("zstd decompression failed: %w", err)
 		}
@@ -68,6 +75,18 @@ func Decompress(data []byte, codec models.CompressionCodec) ([]byte, error) {
 	default:
 		return nil, fmt.Errorf("unsupported compression codec: %s", codec)
 	}
+}
+
+// NewStreamingCompressor creates a streaming multi-threaded Zstandard encoder utilizing all CPU cores.
+func NewStreamingCompressor(w io.Writer) (*zstd.Encoder, error) {
+	concurrency := runtime.GOMAXPROCS(0)
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	return zstd.NewWriter(w,
+		zstd.WithEncoderLevel(zstd.SpeedFastest),
+		zstd.WithEncoderConcurrency(concurrency),
+	)
 }
 
 // DecompressReader returns an io.ReadCloser that decompresses the stream if needed.

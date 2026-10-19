@@ -3,7 +3,9 @@ package metadata
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -163,5 +165,70 @@ func TestMetadataAndGC(t *testing.T) {
 	}
 	if statsAfterDelete.ObjectsDeleted != 1 {
 		t.Errorf("Expected blob1 deleted after archive soft-delete, got %d", statsAfterDelete.ObjectsDeleted)
+	}
+}
+
+func TestOpenReadOnly(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "meta_ro_test_*")
+	if err != nil {
+		t.Fatalf("MkdirTemp failed: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	dbPath := filepath.Join(tmpDir, "meta.db")
+
+	// 1. Opening non-existent file read-only should return os.ErrNotExist
+	_, err = OpenReadOnly(dbPath)
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Expected os.ErrNotExist, got %v", err)
+	}
+
+	// 2. Create and populate read-write database
+	rwDB, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	ctx := context.Background()
+	manifest := &models.ArchiveManifest{
+		ArchiveID:              "arc_ro",
+		OriginalName:           "ro.tar",
+		TotalUncompressedBytes: 500,
+		UncompressedSHA256:     "sha_ro",
+		TotalEntries:           1,
+		CreatedAt:              time.Now(),
+	}
+	if err := rwDB.SaveArchiveTransaction(ctx, manifest, nil, nil); err != nil {
+		t.Fatalf("SaveArchiveTransaction failed: %v", err)
+	}
+	rwDB.Close()
+
+	// 3. Open read-only
+	roDB, err := OpenReadOnly(dbPath)
+	if err != nil {
+		t.Fatalf("OpenReadOnly failed: %v", err)
+	}
+	defer roDB.Close()
+
+	// Query should succeed
+	rec, err := roDB.GetArchive(ctx, "arc_ro")
+	if err != nil {
+		t.Fatalf("GetArchive via read-only DB failed: %v", err)
+	}
+	if rec.Name != "ro.tar" {
+		t.Errorf("Unexpected record name: %s", rec.Name)
+	}
+
+	status, err := roDB.GetSystemStatus(ctx)
+	if err != nil {
+		t.Fatalf("GetSystemStatus via read-only DB failed: %v", err)
+	}
+	if status.TotalArchives != 1 {
+		t.Errorf("Expected 1 archive in status, got %d", status.TotalArchives)
+	}
+
+	// 4. Write operation on read-only DB must fail
+	writeErr := roDB.SoftDeleteArchive(ctx, "arc_ro")
+	if writeErr == nil {
+		t.Errorf("Expected error writing to read-only DB, but succeeded")
 	}
 }

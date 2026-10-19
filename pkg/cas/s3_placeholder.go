@@ -110,6 +110,16 @@ func (s *S3BlobStore) ListObjects(ctx context.Context) ([]StorageObject, error) 
 	return nil, fmt.Errorf("S3BlobStore is a placeholder in this local proof-of-concept")
 }
 
+// CreateTempBlob placeholder for S3 multipart upload staging.
+func (s *S3BlobStore) CreateTempBlob(ctx context.Context) (io.WriteCloser, string, error) {
+	return nil, "", fmt.Errorf("S3BlobStore is a placeholder in this local proof-of-concept")
+}
+
+// CommitBlob placeholder for S3 finalization.
+func (s *S3BlobStore) CommitBlob(ctx context.Context, tmpPath string, hash string) error {
+	return fmt.Errorf("S3BlobStore is a placeholder in this local proof-of-concept")
+}
+
 // Close closes any underlying connections or workers.
 func (s *S3BlobStore) Close() error {
 	return nil

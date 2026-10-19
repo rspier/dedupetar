@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -116,6 +117,31 @@ func initContext(dataDir string, blobThreshold int64) (*engine.Engine, *metadata
 	return eng, db, blobStore, cleanup
 }
 
+func initReadContext(dataDir string) (*engine.Engine, *metadata.DB, cas.BlobStore, func(), error) {
+	dbPath := filepath.Join(dataDir, "meta.db")
+	db, err := metadata.OpenReadOnly(dbPath)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+
+	casDir := filepath.Join(dataDir, "cas")
+	blobStore, err := cas.NewLocalBlobStore(casDir)
+	if err != nil {
+		db.Close()
+		return nil, nil, nil, nil, fmt.Errorf("opening local blob store: %w", err)
+	}
+
+	pm := cas.NewPackfileManager(blobStore, cas.Config{})
+	eng := engine.New(db, blobStore, pm, cas.DefaultBlobThreshold)
+
+	cleanup := func() {
+		db.Close()
+		blobStore.Close()
+	}
+
+	return eng, db, blobStore, cleanup, nil
+}
+
 func runIngest(dataDir string, args []string) {
 	fs := flag.NewFlagSet("ingest", flag.ExitOnError)
 	nameFlag := fs.String("name", "", "Custom name for archive")
@@ -175,7 +201,11 @@ func runExtract(dataDir string, args []string) {
 	archiveID := args[0]
 	outPath := args[1]
 
-	eng, _, _, cleanup := initContext(dataDir, 0)
+	eng, _, _, cleanup, err := initReadContext(dataDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error opening repository: %v\n", err)
+		os.Exit(1)
+	}
 	defer cleanup()
 
 	outFile, err := os.Create(outPath)
@@ -210,7 +240,11 @@ func runVerify(dataDir string, args []string) {
 		origPath = args[1]
 	}
 
-	eng, _, _, cleanup := initContext(dataDir, 0)
+	eng, _, _, cleanup, err := initReadContext(dataDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error opening repository: %v\n", err)
+		os.Exit(1)
+	}
 	defer cleanup()
 
 	ctx := context.Background()
@@ -259,7 +293,17 @@ func runList(dataDir string, args []string) {
 	allFlag := fs.Bool("all", false, "Include deleted archives")
 	fs.Parse(args)
 
-	eng, _, _, cleanup := initContext(dataDir, 0)
+	eng, _, _, cleanup, err := initReadContext(dataDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+			fmt.Fprintln(w, "ARCHIVE ID\tNAME\tUNCOMPRESSED SIZE\tENTRIES\tSTATUS\tCREATED AT")
+			w.Flush()
+			return
+		}
+		fmt.Fprintf(os.Stderr, "Error listing archives: %v\n", err)
+		os.Exit(1)
+	}
 	defer cleanup()
 
 	ctx := context.Background()
@@ -285,7 +329,11 @@ func runShow(dataDir string, args []string) {
 	}
 
 	archiveID := args[0]
-	eng, _, _, cleanup := initContext(dataDir, 0)
+	eng, _, _, cleanup, err := initReadContext(dataDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error opening repository: %v\n", err)
+		os.Exit(1)
+	}
 	defer cleanup()
 
 	ctx := context.Background()
@@ -388,7 +436,19 @@ func runStatus(dataDir string, args []string) {
 	jsonFlag := fs.Bool("json", false, "Output status as JSON")
 	fs.Parse(args)
 
-	eng, _, _, cleanup := initContext(dataDir, 0)
+	eng, _, _, cleanup, err := initReadContext(dataDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			if *jsonFlag {
+				fmt.Println("{}")
+			} else {
+				fmt.Println("No repository found (data directory is empty or uninitialized).")
+			}
+			return
+		}
+		fmt.Fprintf(os.Stderr, "Error opening repository: %v\n", err)
+		os.Exit(1)
+	}
 	defer cleanup()
 
 	ctx := context.Background()
