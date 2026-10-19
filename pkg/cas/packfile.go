@@ -59,20 +59,11 @@ func (pm *PackfileManager) SetActivePackfile(packID string, size int64) {
 	pm.activePackSize = size
 }
 
-// WritePayload allocates and writes a new payload to either a standalone CAS blob or an active packfile.
-// It applies adaptive Zstandard compression: if compression saves >= 5%, the compressed bytes are stored.
-func (pm *PackfileManager) WritePayload(ctx context.Context, hash string, rawData []byte) (models.PayloadLocation, string, int64, error) {
-	rawSize := int64(len(rawData))
-
-	// Attempt adaptive Zstandard compression
-	storedData, codec, err := CompressAdaptive(rawData)
-	if err != nil {
-		return models.PayloadLocation{}, "", 0, fmt.Errorf("compressing payload: %w", err)
-	}
+// WritePrecompressedPayload writes an already-compressed small payload to the active packfile.
+func (pm *PackfileManager) WritePrecompressedPayload(ctx context.Context, hash string, rawSize int64, storedData []byte, codec models.CompressionCodec) (models.PayloadLocation, string, int64, error) {
 	storedSize := int64(len(storedData))
 
 	if rawSize > pm.blobThreshold {
-		// Large payload: store as standalone CAS blob
 		if err := pm.store.PutBlob(ctx, hash, bytes.NewReader(storedData), storedSize); err != nil {
 			return models.PayloadLocation{}, "", 0, fmt.Errorf("putting standalone blob: %w", err)
 		}
@@ -85,7 +76,6 @@ func (pm *PackfileManager) WritePayload(ctx context.Context, hash string, rawDat
 		return loc, hash, storedSize, nil
 	}
 
-	// Small payload (<= threshold): store into active packfile
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 
@@ -115,6 +105,19 @@ func (pm *PackfileManager) WritePayload(ctx context.Context, hash string, rawDat
 		},
 	}
 	return loc, packID, storedSize, nil
+}
+
+// WritePayload allocates and writes a new payload to either a standalone CAS blob or an active packfile.
+// It applies adaptive Zstandard compression: if compression saves >= 5%, the compressed bytes are stored.
+func (pm *PackfileManager) WritePayload(ctx context.Context, hash string, rawData []byte) (models.PayloadLocation, string, int64, error) {
+	rawSize := int64(len(rawData))
+
+	// Attempt adaptive Zstandard compression
+	storedData, codec, err := CompressAdaptive(rawData)
+	if err != nil {
+		return models.PayloadLocation{}, "", 0, fmt.Errorf("compressing payload: %w", err)
+	}
+	return pm.WritePrecompressedPayload(ctx, hash, rawSize, storedData, codec)
 }
 
 // OpenSlice opens a streaming reader for a payload given its location, decompressing transparently.

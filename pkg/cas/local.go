@@ -1,6 +1,7 @@
 package cas
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io"
@@ -9,6 +10,12 @@ import (
 	"sync"
 )
 
+type packWriterHandle struct {
+	f      *os.File
+	w      *bufio.Writer
+	offset uint64
+}
+
 // LocalBlobStore implements BlobStore using the local filesystem.
 type LocalBlobStore struct {
 	baseDir      string
@@ -16,6 +23,7 @@ type LocalBlobStore struct {
 	packfilesDir string
 	mu           sync.Mutex
 	packLocks    sync.Map // packfileID -> *sync.Mutex
+	packWriters  sync.Map // packfileID -> *packWriterHandle
 }
 
 // NewLocalBlobStore initializes local directory structures.
@@ -141,35 +149,51 @@ func (s *LocalBlobStore) AppendPackfileSlice(ctx context.Context, packfileID str
 	mu.Lock()
 	defer mu.Unlock()
 
-	dst := s.packfilePath(packfileID)
-	f, err := os.OpenFile(dst, os.O_CREATE|os.O_RDWR, 0644)
-	if err != nil {
-		return 0, fmt.Errorf("opening packfile %s: %w", packfileID, err)
+	var h *packWriterHandle
+	if val, ok := s.packWriters.Load(packfileID); ok {
+		h = val.(*packWriterHandle)
+	} else {
+		dst := s.packfilePath(packfileID)
+		f, err := os.OpenFile(dst, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
+		if err != nil {
+			return 0, fmt.Errorf("opening packfile %s: %w", packfileID, err)
+		}
+		curOffset, err := f.Seek(0, io.SeekEnd)
+		if err != nil {
+			f.Close()
+			return 0, fmt.Errorf("seeking packfile: %w", err)
+		}
+		h = &packWriterHandle{
+			f:      f,
+			w:      bufio.NewWriterSize(f, 512*1024),
+			offset: uint64(curOffset),
+		}
+		s.packWriters.Store(packfileID, h)
 	}
-	defer f.Close()
 
-	curOffset, err := f.Seek(0, io.SeekEnd)
-	if err != nil {
-		return 0, fmt.Errorf("seeking to end of packfile: %w", err)
-	}
-
-	written, err := io.Copy(f, r)
+	curOffset := h.offset
+	written, err := io.Copy(h.w, r)
 	if err != nil {
 		return 0, fmt.Errorf("appending to packfile: %w", err)
 	}
 	if size > 0 && written != size {
 		return 0, fmt.Errorf("packfile append size mismatch: wrote %d, want %d", written, size)
 	}
+	h.offset += uint64(written)
 
-	if err := f.Sync(); err != nil {
-		return 0, fmt.Errorf("syncing packfile: %w", err)
-	}
-
-	return uint64(curOffset), nil
+	return curOffset, nil
 }
 
 // GetPackfileSlice returns a ReadCloser for a byte range [offset, offset+length) within a packfile.
 func (s *LocalBlobStore) GetPackfileSlice(ctx context.Context, packfileID string, offset uint64, length uint32) (io.ReadCloser, error) {
+	// If packfile is currently open for writing, flush any buffered bytes first
+	if val, ok := s.packWriters.Load(packfileID); ok {
+		mu := s.getPackMutex(packfileID)
+		mu.Lock()
+		_ = val.(*packWriterHandle).w.Flush()
+		mu.Unlock()
+	}
+
 	dst := s.packfilePath(packfileID)
 	f, err := os.Open(dst)
 	if err != nil {
@@ -185,6 +209,14 @@ func (s *LocalBlobStore) GetPackfileSlice(ctx context.Context, packfileID string
 
 // DeleteObject deletes a blob or packfile by its ID.
 func (s *LocalBlobStore) DeleteObject(ctx context.Context, objectID string, objectType string) error {
+	if objectType == "packfile" {
+		if val, ok := s.packWriters.LoadAndDelete(objectID); ok {
+			h := val.(*packWriterHandle)
+			_ = h.w.Flush()
+			_ = h.f.Close()
+		}
+	}
+
 	var target string
 	if objectType == "packfile" {
 		target = s.packfilePath(objectID)
@@ -246,6 +278,12 @@ func (s *LocalBlobStore) ListObjects(ctx context.Context) ([]StorageObject, erro
 }
 
 func (s *LocalBlobStore) Close() error {
+	s.packWriters.Range(func(key, value interface{}) bool {
+		h := value.(*packWriterHandle)
+		_ = h.w.Flush()
+		_ = h.f.Close()
+		return true
+	})
 	return nil
 }
 

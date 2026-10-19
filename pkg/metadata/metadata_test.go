@@ -78,7 +78,7 @@ func TestMetadataAndGC(t *testing.T) {
 		},
 	}
 
-	if err := db.SaveArchiveTransaction(ctx, manifest, []string{blob1Hash}, chunks); err != nil {
+	if err := db.SaveArchiveTransaction(ctx, manifest, []string{blob1Hash}, chunks, IngestBatchMetadata{}); err != nil {
 		t.Fatalf("SaveArchiveTransaction failed: %v", err)
 	}
 
@@ -197,7 +197,7 @@ func TestOpenReadOnly(t *testing.T) {
 		TotalEntries:           1,
 		CreatedAt:              time.Now(),
 	}
-	if err := rwDB.SaveArchiveTransaction(ctx, manifest, nil, nil); err != nil {
+	if err := rwDB.SaveArchiveTransaction(ctx, manifest, nil, nil, IngestBatchMetadata{}); err != nil {
 		t.Fatalf("SaveArchiveTransaction failed: %v", err)
 	}
 	rwDB.Close()

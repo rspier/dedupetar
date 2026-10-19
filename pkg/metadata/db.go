@@ -24,11 +24,11 @@ type DB struct {
 
 // Open initializes SQLite connection in read-write mode and runs schema migrations.
 func Open(dataSourceName string) (*DB, error) {
-	// Add pragmas for WAL mode and busy timeout for concurrent safety
+	// Add pragmas for WAL mode, busy timeout, normal synchronous, and 64MB cache
 	dsn := dataSourceName
 	if dsn != ":memory:" {
 		if !strings.Contains(dsn, "_journal_mode") {
-			dsn += "?_journal_mode=WAL&_busy_timeout=5000"
+			dsn += "?_journal_mode=WAL&_busy_timeout=5000&_synchronous=NORMAL&_cache_size=-64000"
 		}
 	}
 	db, err := sql.Open("sqlite", dsn)
@@ -253,8 +253,110 @@ func (d *DB) RecordStorageObject(ctx context.Context, objectID string, objectTyp
 	return err
 }
 
-// SaveArchiveTransaction saves the archive record, its manifest, recipe chunks, and referenced blob/packfile IDs in a single atomic transaction.
-func (d *DB) SaveArchiveTransaction(ctx context.Context, manifest *models.ArchiveManifest, blobIDs []string, chunks []models.RecipeChunk) error {
+// IngestBatchMetadata contains pending CAS mappings, fingerprints, and storage objects to be committed in an atomic batch.
+type IngestBatchMetadata struct {
+	CASEntries       map[string]models.PayloadLocation
+	Fingerprints     map[string]string
+	StorageObjects   map[string]models.StorageObjectRecord
+	ActivePackfileID string
+	ActivePackfileSz int64
+}
+
+// FlushBatch writes a batch of CAS entries, fingerprints, and storage objects to the database in a single atomic transaction.
+func (d *DB) FlushBatch(ctx context.Context, batch IngestBatchMetadata) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	tx, err := d.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("starting flush transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	if err := d.applyBatch(ctx, tx, batch); err != nil {
+		return err
+	}
+
+	return tx.Commit()
+}
+
+func (d *DB) applyBatch(ctx context.Context, tx *sql.Tx, batch IngestBatchMetadata) error {
+	if len(batch.CASEntries) > 0 {
+		stmtCAS, err := tx.PrepareContext(ctx,
+			"INSERT OR REPLACE INTO cas_entries (hash, object_id, object_type, offset, length, uncompressed_length, codec) VALUES (?, ?, ?, ?, ?, ?, ?)")
+		if err != nil {
+			return fmt.Errorf("preparing cas stmt: %w", err)
+		}
+		defer stmtCAS.Close()
+
+		for hash, loc := range batch.CASEntries {
+			var objID string
+			var offset, length, uncompLen int64
+			codec := string(loc.Codec)
+			if codec == "" {
+				codec = string(models.CodecNone)
+			}
+			if loc.Type == models.StorageTypeBlob {
+				objID = loc.StandaloneBlobHash
+				length = loc.CompressedSize
+				uncompLen = loc.CompressedSize
+			} else if loc.PackfileSlice != nil {
+				objID = loc.PackfileSlice.PackfileID
+				offset = int64(loc.PackfileSlice.Offset)
+				length = int64(loc.PackfileSlice.Length)
+				uncompLen = int64(loc.PackfileSlice.UncompressedLength)
+				codec = string(loc.PackfileSlice.Codec)
+			}
+			if _, err := stmtCAS.ExecContext(ctx, hash, objID, string(loc.Type), offset, length, uncompLen, codec); err != nil {
+				return fmt.Errorf("inserting cas entry: %w", err)
+			}
+		}
+	}
+
+	if len(batch.Fingerprints) > 0 {
+		stmtFP, err := tx.PrepareContext(ctx, "INSERT OR REPLACE INTO file_fingerprints (fingerprint, hash) VALUES (?, ?)")
+		if err != nil {
+			return fmt.Errorf("preparing fp stmt: %w", err)
+		}
+		defer stmtFP.Close()
+
+		for fp, h := range batch.Fingerprints {
+			if _, err := stmtFP.ExecContext(ctx, fp, h); err != nil {
+				return fmt.Errorf("inserting fingerprint: %w", err)
+			}
+		}
+	}
+
+	if len(batch.StorageObjects) > 0 {
+		stmtObj, err := tx.PrepareContext(ctx, "INSERT OR REPLACE INTO storage_objects (object_id, object_type, byte_size, created_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)")
+		if err != nil {
+			return fmt.Errorf("preparing obj stmt: %w", err)
+		}
+		defer stmtObj.Close()
+
+		for _, obj := range batch.StorageObjects {
+			if _, err := stmtObj.ExecContext(ctx, obj.ObjectID, obj.ObjectType, obj.ByteSize); err != nil {
+				return fmt.Errorf("inserting storage object: %w", err)
+			}
+		}
+	}
+
+	if batch.ActivePackfileID != "" {
+		_, err := tx.ExecContext(ctx,
+			"INSERT INTO active_packfiles (packfile_id, current_size, sealed) VALUES (?, ?, 0) "+
+				"ON CONFLICT(packfile_id) DO UPDATE SET current_size = excluded.current_size",
+			batch.ActivePackfileID, batch.ActivePackfileSz,
+		)
+		if err != nil {
+			return fmt.Errorf("updating active packfile: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// SaveArchiveTransaction saves the archive record, its manifest, recipe chunks, and referenced blob/packfile IDs, along with any batched CAS and fingerprint entries in a single atomic transaction.
+func (d *DB) SaveArchiveTransaction(ctx context.Context, manifest *models.ArchiveManifest, blobIDs []string, chunks []models.RecipeChunk, batch IngestBatchMetadata) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
@@ -321,6 +423,11 @@ func (d *DB) SaveArchiveTransaction(ctx context.Context, manifest *models.Archiv
 		if _, err := stmtChunk.ExecContext(ctx, manifest.ArchiveID, chunk.ChunkIndex, len(chunk.Entries), chunkBytes); err != nil {
 			return fmt.Errorf("inserting chunk %d: %w", chunk.ChunkIndex, err)
 		}
+	}
+
+	// 5. Apply batched metadata (CAS entries, fingerprints, storage objects, active packfile)
+	if err := d.applyBatch(ctx, tx, batch); err != nil {
+		return fmt.Errorf("applying metadata batch: %w", err)
 	}
 
 	return tx.Commit()

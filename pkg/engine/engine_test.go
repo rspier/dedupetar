@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"tarchive/pkg/cas"
 	"tarchive/pkg/metadata"
@@ -468,5 +469,28 @@ func TestDuplicateFilePayloadShortCircuit(t *testing.T) {
 	if !bytes.Equal(buf.Bytes(), tar2) {
 		t.Fatalf("Reconstructed archive2 does not match original tar2 byte-for-byte!")
 	}
+}
+
+func TestProfilePerl(t *testing.T) {
+	perlTar := "/tmp/pause/authors/id/W/WO/WOLFSAGE/perl-5.21.1.tar.gz"
+	if _, err := os.Stat(perlTar); os.IsNotExist(err) {
+		t.Skip("perl tar not found")
+	}
+	f, err := os.Open(perlTar)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	eng, db, _, tmpDir := setupTestEngine(t, 1024*1024)
+	defer os.RemoveAll(tmpDir)
+	defer db.Close()
+
+	t0 := time.Now()
+	res, err := eng.Ingest(context.Background(), f, IngestOptions{Name: "perl.tar.gz"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("Ingest took %v: %d entries, %d bytes", time.Since(t0), res.TotalEntries, res.TotalUncompressedBytes)
 }
 
